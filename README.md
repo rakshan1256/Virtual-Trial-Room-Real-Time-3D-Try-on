@@ -1,7 +1,5 @@
 # Virtual-Trial-Room-Real-Time-3D-Try-on
 
-# Virtual Trial Room — Real-Time 3D Try-On in the Browser
-
 A webcam "mirror" that puts a 3D shirt on you **live**: it follows your shoulders, turns with your body, bends its sleeves with your arms and fits itself to your body shape — all in the browser, no install.
 A second mode takes a photo and sends it to a diffusion try-on model (CatVTON) for a photo-realistic result.
 
