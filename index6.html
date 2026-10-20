@@ -1,0 +1,1453 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Try-On — Step 6f (wider neckline)</title>
+
+  <!-- The import map must come BEFORE any module script, so it lives in <head>. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #111; }
+    /* Every layer sits exactly on top of the others. NOTHING is mirrored with CSS.
+       Bottom → top: camera video, shirt shadow, 3D shirt, "arms in front" layer, debug drawings. */
+    canvas { position: fixed; top: 0; left: 0; }
+    #video-canvas  { z-index: 0; }
+    #shadow-canvas { z-index: 1; pointer-events: none; }
+    #three-canvas  { z-index: 2; }
+    #occ-canvas    { z-index: 3; pointer-events: none; }
+    #debug-canvas  { z-index: 4; pointer-events: none; }
+    #hud {
+      position: fixed; top: 10px; left: 10px; z-index: 10;
+      background: rgba(0,0,0,0.75); color: #0f0;
+      font: 12px/1.4 monospace; padding: 8px 12px; border-radius: 6px;
+      white-space: pre-wrap; max-width: 30vw;          /* narrow column on the left, off your shoulders */
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline style="display:none"></video>
+  <canvas id="video-canvas"></canvas>
+  <canvas id="shadow-canvas"></canvas>
+  <canvas id="occ-canvas"></canvas>
+  <canvas id="debug-canvas"></canvas>
+  <div id="hud">Starting…</div>
+  <div id="countdown" style="
+    display:none; position:fixed; top:12px; right:16px; z-index:20;
+    color:#ff0; background:rgba(0,0,0,0.6); padding:6px 18px; border-radius:8px;
+    font: bold 64px/1.1 monospace; pointer-events:none;"></div>
+
+  <!-- Step 6a: capture button + result panel -->
+  <button id="capture-btn">Capture (C)</button>
+  <div id="result-panel">
+    <div class="row">
+      <figure><img id="res-person"><figcaption id="cap-person">You (captured)</figcaption></figure>
+      <figure><img id="res-garment"><figcaption id="cap-garment">Shirt sent to CatVTON</figcaption></figure>
+      <figure><img id="res-result"><figcaption>CatVTON result</figcaption></figure>
+    </div>
+    <p id="res-status"></p>
+    <p class="hint">Esc or C to close</p>
+  </div>
+  <style>
+    #capture-btn {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 15;
+      font: bold 18px system-ui, sans-serif; padding: 12px 28px; border: 0; border-radius: 999px;
+      background: #ffd400; color: #111; cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    #result-panel {
+      display: none; position: fixed; inset: 0; z-index: 30; background: rgba(10,10,10,0.92);
+      color: #eee; font: 15px system-ui, sans-serif; text-align: center; padding: 24px 16px;
+      overflow: auto;
+    }
+    #result-panel .row { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    #result-panel figure { margin: 0; flex: 0 1 30%; min-width: 200px; }
+    #result-panel img { width: 100%; aspect-ratio: 3 / 4; object-fit: contain; background: #222; border-radius: 8px; }
+    #result-panel figcaption { margin-top: 6px; color: #aaa; }
+    #res-status { font-size: 17px; margin: 18px 0 4px; }
+    #result-panel .hint { color: #777; margin: 0; }
+  </style>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { PoseLandmarker, FilesetResolver }
+      from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+    // =====================================================================
+    // SETTINGS
+    // Offsets are measured in SHOULDER-WIDTHS, so a fit you dial in at one
+    // distance stays correct at every distance.
+    // =====================================================================
+    const CONFIG = {
+      MIRROR: true,            // mirror like a real mirror (done ONCE, in code)
+      MIN_SHOULDER_VIS: 0.5,   // only shoulders are required; hips are optional
+      HOLD_MS: 500,            // keep the shirt in place this long if tracking drops
+      SMOOTH: 0.5,             // 1 = raw/jittery, lower = smoother but laggier
+      fitWidth: 1.62,          // shirt width ÷ shoulder width   (+ / - keys)
+      offsetX: 0.0,            // sideways, in shoulder-widths   (← / → keys)
+      offsetY: 0.32,           // up/down, in shoulder-widths    (↑ / ↓ keys)
+      showSkeleton: true,      // S key
+      showHud: true,           // H key
+      applyYaw: true,          // N key: turn the shirt with your body on/off
+      YAW_SIGN: -1,            // Y key: flip if the shirt turns the OPPOSITE way to you
+      // --- Step 3 ---
+      occlusion: true,         // O key: draw your forearms/hands IN FRONT of the shirt
+      BEHIND_M: 0.10,          // an arm this many metres behind your torso is NOT drawn in front
+      LOOSE: 1.05,             // shirt is this much bigger than your body side-on (5% ease)
+      BACK_NOSE_VIS: 0.35,     // nose visibility below this (while square-on) = you're facing away
+      // --- Step 4 ---
+      lightMatch: true,        // L key: light the shirt like your room (compare on/off)
+      shadow: true,            // D key: soft shadow where the shirt meets your body
+      brightness: 1.0,         // [ / ] keys: nudge the shirt darker / brighter
+      // --- Step 5a ---
+      showArms: true,          // A key: yellow = your arm in 3D, cyan dashed = where the sleeve points
+      // --- Step 5b ---
+      bendSleeves: true,       // B key: sleeves follow your arms on/off (compare)
+      showWeights: false,      // W key: colour the shirt by "who follows what" (red = arm, blue = body)
+      SLEEVE_BLEND: 0.06,      // width of the soft zone around the armhole, in shirt-widths
+      MAX_BEND: 110,           // never rotate a sleeve more than this (degrees) — stops wild twisting
+      ARM_GAP: 0.18,           // upper-arm thickness as a share of shoulder width (body may not grow under it)
+      // --- Step 6a ---
+      BRIDGE_URL: 'http://localhost:5000/tryon',   // tryon_server.py (Track 1 bridge)
+      CAPTURE_DELAY: 3000,     // ms countdown after pressing C, so you can get into pose
+      NECK_RISE: 0.5,          // mask neckline height: share of the way from shoulders up to mouth
+    };
+
+    // ---------------------------------------------------------------------
+    // DOM + Three.js setup
+    // ---------------------------------------------------------------------
+    const video = document.getElementById('webcam');
+    const videoCanvas = document.getElementById('video-canvas');
+    const vctx = videoCanvas.getContext('2d');
+    const occCanvas = document.getElementById('occ-canvas');
+    const octx = occCanvas.getContext('2d');
+    const shadowCanvas = document.getElementById('shadow-canvas');
+    const shctx = shadowCanvas.getContext('2d');
+    const debugCanvas = document.getElementById('debug-canvas');
+    const dctx = debugCanvas.getContext('2d');
+    const hud = document.getElementById('hud');
+
+    // The person mask arrives as numbers; we paint it into this small offscreen canvas.
+    const maskCanvas = document.createElement('canvas');
+    const mctx = maskCanvas.getContext('2d');
+    let maskImage = null;
+    let maskReady = false;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 0);
+    renderer.domElement.id = 'three-canvas';
+    document.body.insertBefore(renderer.domElement, occCanvas);
+
+    // Orthographic camera measured in SCREEN PIXELS (origin = screen centre, y up).
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 5000);
+    camera.position.z = 2000;
+
+    const scene = new THREE.Scene();
+    // Two lights: a "sky" light (bright from above, dimmer from below — like a real room)
+    // and a directional "sun" whose side, colour and strength Step 4 copies from your camera.
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x555555, 1.0);
+    scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+    sun.position.set(1, 2, 3);
+    scene.add(sun);
+
+    // Verification markers: red = your LEFT shoulder, blue = your RIGHT.
+    function makeMarker(color) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(6, 12, 12),
+        new THREE.MeshBasicMaterial({ color, depthTest: false })
+      );
+      m.renderOrder = 999;
+      m.visible = false;
+      scene.add(m);
+      return m;
+    }
+    const markerL = makeMarker(0xff3333);
+    const markerR = makeMarker(0x3399ff);
+
+    // ---------------------------------------------------------------------
+    // LAYOUT — one place that knows how the video is cropped onto the screen.
+    // ---------------------------------------------------------------------
+    const layout = { W: 0, H: 0, drawW: 0, drawH: 0, offX: 0, offY: 0 };
+
+    function updateLayout() {
+      const W = window.innerWidth, H = window.innerHeight;
+      layout.W = W; layout.H = H;
+      for (const c of [videoCanvas, shadowCanvas, occCanvas, debugCanvas]) { c.width = W; c.height = H; }
+      renderer.setSize(W, H);
+      camera.left = -W / 2; camera.right = W / 2;
+      camera.top = H / 2;   camera.bottom = -H / 2;
+      camera.updateProjectionMatrix();
+
+      const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+      const s = Math.max(W / vw, H / vh);          // "cover" fit
+      layout.drawW = vw * s;
+      layout.drawH = vh * s;
+      layout.offX = (W - layout.drawW) / 2;
+      layout.offY = (H - layout.drawH) / 2;
+    }
+    window.addEventListener('resize', updateLayout);
+
+    // Normalised (0–1 of the full video frame) → screen pixel, honouring crop + mirror.
+    function toScreen(lm) {
+      const u = CONFIG.MIRROR ? 1 - lm.x : lm.x;
+      return { x: layout.offX + u * layout.drawW, y: layout.offY + lm.y * layout.drawH };
+    }
+    // Screen pixel → Three.js world (pixels, centred, y up)
+    function screenToWorld(p) {
+      return { x: p.x - layout.W / 2, y: layout.H / 2 - p.y };
+    }
+    // ...and back again: world → normalised video coordinates
+    function worldToNorm(p) {
+      const sx = p.x + layout.W / 2, sy = layout.H / 2 - p.y;
+      const u = (sx - layout.offX) / layout.drawW;
+      return { x: CONFIG.MIRROR ? 1 - u : u, y: (sy - layout.offY) / layout.drawH };
+    }
+    const normToWorld = (x, y) => screenToWorld(toScreen({ x, y }));
+
+    // Draw anything shaped like the camera frame (the video, or the mask) with
+    // exactly the same crop + mirror, so every layer lines up pixel for pixel.
+    function drawMapped(ctx, src) {
+      ctx.save();
+      if (CONFIG.MIRROR) { ctx.translate(layout.W, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(src, layout.offX, layout.offY, layout.drawW, layout.drawH);
+      ctx.restore();
+    }
+
+    // ---------------------------------------------------------------------
+    // SHIRT — normalised so its bounding-box WIDTH = 1 unit, anchored at top-centre.
+    // ---------------------------------------------------------------------
+    let shirtGroup = null;
+    let modelSize = null;
+
+    new GLTFLoader().load('shirt.glb', (gltf) => {
+      const model = gltf.scene;
+      // Fabric, not plastic: cloth is matte (rough) and never metallic.
+      model.traverse((o) => {
+        if (!o.isMesh) return;
+        for (const mat of Array.isArray(o.material) ? o.material : [o.material]) {
+          if ('roughness' in mat) mat.roughness = Math.max(mat.roughness ?? 1, 0.85);
+          if ('metalness' in mat) mat.metalness = 0;
+          mat.needsUpdate = true;
+        }
+      });
+      const box = new THREE.Box3().setFromObject(model);
+      modelSize = box.getSize(new THREE.Vector3());
+      const centre = box.getCenter(new THREE.Vector3());
+      model.position.sub(new THREE.Vector3(centre.x, box.max.y, centre.z));
+
+      const unit = new THREE.Group();
+      unit.add(model);
+      unit.scale.setScalar(1 / modelSize.x);
+
+      shirtGroup = new THREE.Group();
+      shirtGroup.add(unit);
+      shirtGroup.visible = false;
+      scene.add(shirtGroup);
+      bakeShirt();             // 5b: put every vertex in one coordinate system
+      computeSleeveRest();     // 5a: find the sleeves and which way they point
+      setupSleeveBending();    // 5b: decide which vertices follow which arm
+    }, undefined, (err) => {
+      loadError = 'Could not load shirt.glb — is the page opened through a local server?';
+      console.error(err);
+    });
+
+    // ---------------------------------------------------------------------
+    // POSE DETECTION (+ person mask)
+    // ---------------------------------------------------------------------
+    let landmarker = null;
+    let loadError = null;
+
+    async function setupLandmarker() {
+      const fileset = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+      );
+      const opts = (delegate) => ({
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+          delegate,
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        outputSegmentationMasks: true,   // NEW: an outline of exactly which pixels are "you"
+      });
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(fileset, opts('GPU'));
+      } catch (e) {
+        console.warn('GPU delegate failed, falling back to CPU', e);
+        landmarker = await PoseLandmarker.createFromOptions(fileset, opts('CPU'));
+      }
+    }
+
+    // Yaw (body turn) from MediaPipe's 3D "world" landmarks: angle of the shoulder line seen from above.
+    function computeYaw(wl) {
+      const L = wl[11], R = wl[12];
+      return Math.atan2(L.z - R.z, L.x - R.x);   // 0 ≈ facing camera
+    }
+
+    // ---------------------------------------------------------------------
+    // TRACKING STATE
+    // ---------------------------------------------------------------------
+    let latestLm = null;
+    let measured = null;
+    let freshMeasurement = false;
+    let lastGoodTime = -Infinity;
+    let failReason = 'waiting for camera';
+    let state = 'STARTING';
+
+    const smoothed = {};
+    function ema(key, value) {
+      if (smoothed[key] === undefined) smoothed[key] = value;
+      else smoothed[key] += CONFIG.SMOOTH * (value - smoothed[key]);
+      return smoothed[key];
+    }
+    function emaAngle(key, value) {
+      if (smoothed[key] === undefined) { smoothed[key] = value; return value; }
+      let d = value - smoothed[key];
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      smoothed[key] += CONFIG.SMOOTH * d;
+      return smoothed[key];
+    }
+    function resetSmoothing() { for (const k in smoothed) delete smoothed[k]; }
+    const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+
+    // Learned automatically, then kept:
+    let bodyRatio = null;      // shoulder width ÷ torso length (learned facing the camera)
+    let depthMul = 1;          // how much deeper your body is than the shirt model (learned side-on)
+    let depthNow = 1;          // depth actually applied this frame (full side-on, none facing)
+    let depthLearned = false;
+    let lastArmUp = 0;
+    let sizeSource = '--';
+    let backView = false;
+    let silhouette = null;     // body-outline widths measured from the mask
+
+    const LINKS = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24]];
+
+    function drawSkeleton(lm) {
+      dctx.lineWidth = 2;
+      dctx.strokeStyle = 'rgba(0,255,0,0.7)';
+      for (const [a, b] of LINKS) {
+        if ((lm[a].visibility ?? 0) < 0.5 || (lm[b].visibility ?? 0) < 0.5) continue;
+        const p = toScreen(lm[a]), q = toScreen(lm[b]);
+        dctx.beginPath(); dctx.moveTo(p.x, p.y); dctx.lineTo(q.x, q.y); dctx.stroke();
+      }
+      dctx.fillStyle = 'rgba(255,255,0,0.9)';
+      for (const p of lm) {
+        const s = toScreen(p);
+        dctx.beginPath(); dctx.arc(s.x, s.y, 3, 0, Math.PI * 2); dctx.fill();
+      }
+      dctx.strokeStyle = '#fff'; dctx.fillStyle = '#fff'; dctx.font = 'bold 16px monospace';
+      for (const [i, label] of [[11, 'L'], [12, 'R']]) {
+        const s = toScreen(lm[i]);
+        dctx.beginPath(); dctx.arc(s.x, s.y, 14, 0, Math.PI * 2); dctx.stroke();
+        dctx.fillText(label, s.x - 5, s.y - 20);
+      }
+      // Silhouette measurements (magenta lines) — what the mask says your body width is.
+      if (silhouette) {
+        dctx.strokeStyle = '#f0f'; dctx.lineWidth = 3;
+        for (const row of [silhouette.chest, silhouette.waist]) {
+          if (!row) continue;
+          const a = toScreen(row.leftN), b = toScreen(row.rightN);
+          dctx.beginPath(); dctx.moveTo(a.x, a.y); dctx.lineTo(b.x, b.y); dctx.stroke();
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // PERSON MASK
+    // ---------------------------------------------------------------------
+    // Copy the mask (one number 0–1 per camera pixel) into maskCanvas as white + transparency.
+    function paintMask(data, w, h) {
+      if (maskCanvas.width !== w || maskCanvas.height !== h || !maskImage) {
+        maskCanvas.width = w; maskCanvas.height = h;
+        maskImage = mctx.createImageData(w, h);
+      }
+      const px = maskImage.data;
+      for (let i = 0, j = 0; i < data.length; i++, j += 4) {
+        px[j] = 255; px[j + 1] = 255; px[j + 2] = 255;
+        px[j + 3] = data[i] * 255;
+      }
+      mctx.putImageData(maskImage, 0, 0);
+      maskReady = true;
+    }
+
+    // Walk left and right along one row of the mask from a point inside your body
+    // until we leave "you". Returns your body's width on screen at that height.
+    function widthAtRow(data, w, h, nx, ny) {
+      const row = Math.round(ny * h);
+      const cx = Math.round(nx * w);
+      if (row < 0 || row >= h || cx < 0 || cx >= w) return null;
+      const at = (x) => data[row * w + x];
+      if (at(cx) < 0.5) return null;
+      let l = cx; while (l > 0 && at(l - 1) >= 0.5) l--;
+      let r = cx; while (r < w - 1 && at(r + 1) >= 0.5) r++;
+      const a = normToWorld(l / w, ny), b = normToWorld((r + 1) / w, ny);
+      return {
+        width: Math.abs(b.x - a.x), center: (a.x + b.x) / 2,
+        leftN: { x: l / w, y: ny }, rightN: { x: (r + 1) / w, y: ny },
+      };
+    }
+
+    // Measure at chest height (35% down the torso) and waist height (75% down).
+    function measureSilhouette(data, w, h, m) {
+      if (!m.hipMid) return null;
+      const along = (t) => ({
+        x: m.mid.x + t * (m.hipMid.x - m.mid.x),
+        y: m.mid.y + t * (m.hipMid.y - m.mid.y),
+      });
+      const out = {};
+      for (const [key, t] of [['chest', 0.35], ['waist', 0.75]]) {
+        const n = worldToNorm(along(t));
+        out[key] = widthAtRow(data, w, h, n.x, n.y);
+      }
+      return out;
+    }
+
+    // "Arms in front": cut your forearms + hands out of the camera image and lay
+    // them OVER the shirt. Three canvas steps:
+    //   1. paint rough white shapes along forearms and hands (from the skeleton)
+    //   2. keep only the parts that the person mask says are really you
+    //   3. fill what's left with the real camera picture
+    function drawOcclusion(lm, wl, m) {
+      octx.clearRect(0, 0, layout.W, layout.H);
+      if (!CONFIG.occlusion || !maskReady || !m) return;
+
+      const ref = smoothed.s ? smoothed.s / CONFIG.fitWidth : m.shoulderWidth;  // ≈ your shoulder width
+      const torsoZ = wl ? (wl[11].z + wl[12].z + wl[23].z + wl[24].z) / 4 : 0;
+
+      octx.save();
+      octx.lineCap = 'round';
+      octx.strokeStyle = '#fff';
+      octx.fillStyle = '#fff';
+      for (const [elbow, wrist, fingers] of [[13, 15, [17, 19, 21]], [14, 16, [18, 20, 22]]]) {
+        if ((lm[elbow].visibility ?? 0) < 0.5 || (lm[wrist].visibility ?? 0) < 0.5) continue;
+        // Skip an arm that is clearly BEHIND your body (e.g. the far arm when side-on).
+        if (wl && (wl[elbow].z + wl[wrist].z) / 2 > torsoZ + CONFIG.BEHIND_M) continue;
+        // With your back to the camera, hands resting on your hips sit AT the shirt's
+        // surface, not in front of it — only draw an arm that is clearly nearer the camera.
+        const awayFromCamera = Math.abs(Math.cos(m.yaw ?? 0)) > 0.5 && Math.cos(m.yaw ?? 0) < 0;
+        if (awayFromCamera && wl && (wl[elbow].z + wl[wrist].z) / 2 > torsoZ - 0.05) continue;
+
+        const a = toScreen(lm[elbow]), b = toScreen(lm[wrist]);
+        octx.lineWidth = ref * 0.20;      // ≈ a real forearm (too wide = holes showing your body)
+        octx.beginPath(); octx.moveTo(a.x, a.y); octx.lineTo(b.x, b.y); octx.stroke();
+
+        let hx = b.x, hy = b.y;
+        for (const i of fingers) { const p = toScreen(lm[i]); hx += p.x; hy += p.y; }
+        hx /= 4; hy /= 4;
+        octx.beginPath(); octx.arc(hx, hy, ref * 0.17, 0, Math.PI * 2); octx.fill();
+      }
+      octx.globalCompositeOperation = 'destination-in';   // step 2
+      octx.filter = 'blur(2px)';                            // soft edges, not cut-out edges
+      drawMapped(octx, maskCanvas);
+      octx.filter = 'none';
+      octx.globalCompositeOperation = 'source-in';         // step 3
+      drawMapped(octx, video);
+      octx.restore();
+    }
+
+    // ---------------------------------------------------------------------
+    // STEP 4 — LIGHT MATCHING
+    // We read the camera picture (shrunk to 96×54, plenty for averages) and copy:
+    //   • overall brightness  → how strongly the shirt is lit
+    //   • overall colour cast → the colour of the lights (warm bulb vs cool daylight)
+    //   • which side of YOUR BODY is brighter → which side the main light comes from
+    // ---------------------------------------------------------------------
+    const SW = 96, SH = 54;
+    const sampleCanvas = document.createElement('canvas');
+    sampleCanvas.width = SW; sampleCanvas.height = SH;
+    const sctx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+    const light = { lum: 0.45, r: 1, g: 1, b: 1, side: 0, k: 1 };   // smoothed values
+    const SLOW = 0.05;   // lighting changes slowly — this stops flicker
+
+    function measureLight(maskData, mw, mh, lm) {
+      sctx.drawImage(video, 0, 0, SW, SH);
+      const px = sctx.getImageData(0, 0, SW, SH).data;
+
+      // 1) Whole picture: average colour and brightness.
+      let r = 0, g = 0, b = 0;
+      for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i + 1]; b += px[i + 2]; }
+      const n = px.length / 4;
+      r /= n * 255; g /= n * 255; b /= n * 255;
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const mean = (r + g + b) / 3 || 1;
+      // colour cast, softened to 60% so the shirt's own colours still show
+      const tint = (c) => clamp(1 + 0.6 * (c / mean - 1), 0.75, 1.25);
+
+      // 2) Your torso: is your left or right side brighter? (Only pixels that are "you".)
+      const xs = [lm[11].x, lm[12].x], ys = [lm[11].y, lm[12].y];
+      let x0 = Math.min(...xs), x1 = Math.max(...xs);
+      let y0 = Math.min(...ys);
+      let y1 = Math.min(lm[23].visibility ?? 0, lm[24].visibility ?? 0) > 0.5
+        ? Math.max(lm[23].y, lm[24].y) : y0 + (x1 - x0) * 1.2;
+      const cx = (x0 + x1) / 2;
+      let sumA = 0, nA = 0, sumB = 0, nB = 0;            // A = video-left half, B = video-right
+      for (let j = Math.floor(y0 * SH); j <= Math.ceil(y1 * SH); j++) {
+        for (let i = Math.floor(x0 * SW); i <= Math.ceil(x1 * SW); i++) {
+          if (i < 0 || i >= SW || j < 0 || j >= SH) continue;
+          const mi = Math.floor(j / SH * mh) * mw + Math.floor(i / SW * mw);
+          if (maskData[mi] < 0.5) continue;
+          const k = (j * SW + i) * 4;
+          const l = (0.2126 * px[k] + 0.7152 * px[k + 1] + 0.0722 * px[k + 2]) / 255;
+          if (i / SW < cx) { sumA += l; nA++; } else { sumB += l; nB++; }
+        }
+      }
+      let side = light.side;
+      if (nA > 5 && nB > 5 && Math.abs(Math.cos(measured?.yaw ?? 0)) > 0.7) {  // only when facing
+        const a = sumA / nA, bb = sumB / nB;
+        const screenLeft = CONFIG.MIRROR ? bb : a, screenRight = CONFIG.MIRROR ? a : bb;
+        side = clamp((screenRight - screenLeft) / (screenRight + screenLeft + 1e-6), -0.5, 0.5);
+      }
+
+      light.lum  += SLOW * (lum - light.lum);
+      light.r    += SLOW * (tint(r) - light.r);
+      light.g    += SLOW * (tint(g) - light.g);
+      light.b    += SLOW * (tint(b) - light.b);
+      light.side += SLOW * (side - light.side);
+    }
+
+    function applyLight() {
+      const threeCanvas = renderer.domElement;
+      if (!CONFIG.lightMatch) {
+        hemi.color.setRGB(1, 1, 1); sun.color.setRGB(1, 1, 1);
+        hemi.intensity = 1.0; sun.intensity = 1.6; sun.position.set(1, 2, 3);
+        threeCanvas.style.filter = 'none';
+        light.k = 1;
+        return;
+      }
+      // Webcams auto-adjust exposure to about 0.45 average brightness. Darker than that
+      // → dim the shirt; brighter → brighten it.
+      light.k = clamp(light.lum / 0.45, 0.5, 1.4) * CONFIG.brightness;
+      hemi.intensity = 1.0 * light.k;
+      sun.intensity  = 1.6 * light.k;
+      hemi.color.setRGB(light.r, light.g, light.b);
+      sun.color.setRGB(light.r, light.g, light.b);
+      sun.position.set(light.side * 8, 3, 3);       // + = light from screen-right
+      // A webcam picture is slightly soft and less punchy than a perfect 3D render.
+      // Matching that softness is a big part of not looking "stuck on".
+      threeCanvas.style.filter = 'blur(0.6px) saturate(0.9) contrast(0.95)';
+    }
+
+    // Soft shadow: take the rendered shirt, turn it black, blur it, shift it down a little
+    // (light comes from above), and keep it only where it lands on YOUR BODY.
+    // The shirt hides most of it; what peeks out under the hem and sleeves reads as
+    // "this shirt is sitting on a real body".
+    function drawShadow() {
+      shctx.clearRect(0, 0, layout.W, layout.H);
+      if (!CONFIG.shadow || !shirtGroup || !shirtGroup.visible || !maskReady) return;
+      const ref = smoothed.s ? smoothed.s / CONFIG.fitWidth : 200;   // ≈ shoulder width in px
+      shctx.save();
+      shctx.globalAlpha = 0.45;
+      shctx.filter = `blur(${(ref * 0.05).toFixed(1)}px) brightness(0)`;
+      shctx.drawImage(renderer.domElement,
+        -light.side * ref * 0.06, ref * 0.04, layout.W, layout.H);   // shift away from the light
+      shctx.filter = 'none';
+      shctx.globalAlpha = 1;
+      shctx.globalCompositeOperation = 'destination-in';
+      drawMapped(shctx, maskCanvas);
+      shctx.restore();
+    }
+    let shirtMoved = false;
+
+    // ---------------------------------------------------------------------
+    // STEP 5a — SLEEVE "BONES" (measured only — nothing bends yet)
+    // ---------------------------------------------------------------------
+    // Find which way each sleeve points in the model as it was made ("rest pose").
+    // The shoulder joints sit at known spots on the model, because WE placed the shirt so
+    // they land on your shoulders (fitWidth / offsetY). Vertices further out than that are
+    // sleeve; the outermost ones are the cuff. Shoulder joint → cuff centre = the sleeve's direction.
+    let sleeveRest = null;   // { L: {pivot, dir, count}, R: {...} } in the shirt's own units
+    function computeSleeveRest() {
+      shirtGroup.updateMatrixWorld(true);
+      const px = 0.5 / CONFIG.fitWidth;            // shoulder joint, sideways (shirt width = 1)
+      const py = -CONFIG.offsetY / CONFIG.fitWidth; // shoulder joint, below the shirt's top
+      const pts = { L: [], R: [] };
+      const v = new THREE.Vector3();
+      shirtGroup.traverse((o) => {
+        if (!o.isMesh) return;
+        const pos = o.geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+          if (v.x < -px - 0.05) pts.L.push(v.clone());
+          else if (v.x > px + 0.05) pts.R.push(v.clone());
+        }
+      });
+      sleeveRest = {};
+      for (const side of ['L', 'R']) {
+        if (!pts[side].length) continue;
+        const reach = Math.max(...pts[side].map((p) => Math.abs(p.x)));
+        const cuffFrom = px + 0.7 * (reach - px);          // outermost 30% = the cuff
+        const cuff = pts[side].filter((p) => Math.abs(p.x) >= cuffFrom);
+        const centre = cuff.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(cuff.length);
+        const pivot = new THREE.Vector3(side === 'L' ? -px : px, py, 0);
+        const armpitY = Math.min(...pts[side].map((p) => p.y));   // lowest point of the sleeve
+        sleeveRest[side] = { pivot, dir: centre.sub(pivot).normalize(), count: pts[side].length, armpitY };
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // STEP 5b — A RIG MADE IN CODE
+    // ---------------------------------------------------------------------
+    // 1) Flatten the model: bake each mesh's position/scale into its vertices, so every
+    //    vertex lives in ONE coordinate system (the shirt's: width 1, top-centre = 0).
+    //    Then we can move single vertices without fighting nested transforms.
+    function bakeShirt() {
+      shirtGroup.updateMatrixWorld(true);
+      const meshes = [];
+      shirtGroup.traverse((o) => { if (o.isMesh) meshes.push(o); });
+      const baked = new THREE.Group();
+      for (const o of meshes) {
+        const g = o.geometry.clone();
+        // Rebuild position/normal as plain float lists (models are sometimes packed/compressed).
+        for (const name of ['position', 'normal']) {
+          const a = g.getAttribute(name);
+          if (!a) continue;
+          const arr = new Float32Array(a.count * 3);
+          for (let i = 0; i < a.count; i++) { arr[3*i] = a.getX(i); arr[3*i+1] = a.getY(i); arr[3*i+2] = a.getZ(i); }
+          g.setAttribute(name, new THREE.BufferAttribute(arr, 3));
+        }
+        if (!g.getAttribute('normal')) g.computeVertexNormals();
+        g.applyMatrix4(o.matrixWorld);
+        const m = new THREE.Mesh(g, o.material);
+        m.frustumCulled = false;      // its shape changes every frame, so never skip drawing it
+        baked.add(m);
+      }
+      shirtGroup.clear();
+      shirtGroup.add(baked);
+    }
+
+    // 2) Weights: how strongly each vertex follows its arm (0 = stays with the body, 1 = sleeve).
+    //    Further out than the shoulder joint → sleeve. Below the armpit → body (so the hem
+    //    never moves with your arm). In between: a smooth blend, so fabric stretches, not tears.
+    //    Weights are rounded to 1/32 steps: looks just as smooth, and is much faster.
+    const deform = [];
+    const LEVELS = 32;
+    const smooth01 = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+    let movingCount = 0;
+
+    function setupSleeveBending() {
+      if (!sleeveRest?.L || !sleeveRest?.R) return;
+      const px = Math.abs(sleeveRest.R.pivot.x);
+      const B = CONFIG.SLEEVE_BLEND;
+      const meshes = [];
+      shirtGroup.traverse((o) => { if (o.isMesh) meshes.push(o); });
+      for (const mesh of meshes) {
+        const g = mesh.geometry;
+        const pos = g.getAttribute('position'), nor = g.getAttribute('normal');
+        const n = pos.count;
+        const side = new Uint8Array(n), level = new Uint8Array(n), moving = [];
+        const colors = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          const x = pos.getX(i), y = pos.getY(i);
+          const s = x < 0 ? 0 : 1;                                   // 0 = L sleeve, 1 = R sleeve
+          const armpitY = sleeveRest[s ? 'R' : 'L'].armpitY;
+          const w = smooth01(px - B, px + B, Math.abs(x)) * smooth01(armpitY - B, armpitY, y);
+          side[i] = s;
+          level[i] = Math.round(w * LEVELS);
+          if (level[i] > 0) moving.push(i);
+          colors[3*i] = 0.15 + 0.85 * w; colors[3*i+1] = 0.35 - 0.2 * w; colors[3*i+2] = 1 - 0.85 * w;
+        }
+        // A twin of the mesh, coloured by weight, sharing the SAME vertex positions (W key).
+        const dg = new THREE.BufferGeometry();
+        dg.setAttribute('position', pos);
+        dg.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        if (g.index) dg.setIndex(g.index);
+        const dm = new THREE.Mesh(dg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+        dm.frustumCulled = false;
+        dm.visible = false;
+        mesh.parent.add(dm);
+        deform.push({ mesh, debug: dm, pos, nor, rest: pos.array.slice(), restN: nor.array.slice(),
+                      side, level, moving: Uint32Array.from(moving) });
+        movingCount += moving.length;
+      }
+
+      // How wide is the shirt's BODY (not the sleeves), in shirt units? Slice the body
+      // below the armpits into thin bands and take the typical (median) band width.
+      const top = Math.min(sleeveRest.L.armpitY, sleeveRest.R.armpitY) - 0.05;
+      let bottom = Infinity;
+      for (const d of deform) for (let i = 1; i < d.rest.length; i += 3) bottom = Math.min(bottom, d.rest[i]);
+      bottom += 0.05;
+      const widths = [];
+      for (let y = top; y > bottom; y -= 0.05) {
+        let lo = Infinity, hi = -Infinity;
+        for (const d of deform) {
+          for (let i = 0; i < d.level.length; i++) {
+            if (d.level[i] !== 0) continue;
+            const vy = d.rest[3 * i + 1];
+            if (vy > y || vy <= y - 0.05) continue;
+            const vx = d.rest[3 * i];
+            if (vx < lo) lo = vx;
+            if (vx > hi) hi = vx;
+          }
+        }
+        if (hi > lo) widths.push(hi - lo);
+      }
+      widths.sort((a, b) => a - b);
+      modelBodyW = widths.length ? widths[Math.floor(widths.length / 2)] : null;
+    }
+    let modelBodyW = null;     // shirt body width in shirt units
+    let widthMul = 1;          // how much the BODY is widened to cover yours (sleeves untouched)
+    let widthLearned = false;
+
+    function applyWeightView() {
+      for (const d of deform) { d.mesh.visible = !CONFIG.showWeights; d.debug.visible = CONFIG.showWeights; }
+    }
+
+    // 3) Every frame: work out the rotation that turns each sleeve from its modelled
+    //    direction to your arm's direction, then move each sleeve vertex by its share of it.
+    const sleeveQ = { L: new THREE.Quaternion(), R: new THREE.Quaternion() };   // current sleeve turn
+    const tables = [[], []];
+    const _q = new THREE.Quaternion(), _m4 = new THREE.Matrix4(), _m3 = new THREE.Matrix3(), _v = new THREE.Vector3();
+    const qAngle = (q) => 2 * Math.acos(Math.min(1, Math.abs(q.w)));
+
+    function updateSleeves(m) {
+      if (!deform.length) return;
+      // The arm direction is in screen space; the sleeves live in the shirt's own space
+      // (which is turned, tilted and stretched in depth). Convert: undo turn/tilt, undo depth stretch.
+      const inv = shirtGroup.quaternion.clone().invert();
+      ['L', 'R'].forEach((side, s) => {
+        const rest = sleeveRest[side];
+        const a = m.arms?.[side];
+        const target = new THREE.Quaternion();                    // no turn = sleeve as modelled
+        if (CONFIG.bendSleeves && a) {
+          const t = a.dir.clone().applyQuaternion(inv);
+          t.z /= depthNow;
+          t.normalize();
+          target.setFromUnitVectors(rest.dir, t);
+          const ang = qAngle(target), max = CONFIG.MAX_BEND * Math.PI / 180;
+          if (ang > max) target.copy(new THREE.Quaternion().slerp(target, max / ang));
+        }
+        // smooth toward the target; if the arm is lost, drift gently back to the rest pose
+        sleeveQ[side].slerp(target, a ? CONFIG.SMOOTH : 0.1);
+
+        // One ready-made rotation per weight step: rotate around the shoulder joint.
+        const piv = rest.pivot;
+        for (let k = 0; k <= LEVELS; k++) {
+          _q.identity().slerp(sleeveQ[side], k / LEVELS);
+          _m3.setFromMatrix4(_m4.makeRotationFromQuaternion(_q));
+          _v.copy(piv).applyQuaternion(_q);
+          tables[s][k] = { e: _m3.elements.slice(), t: [piv.x - _v.x, piv.y - _v.y, piv.z - _v.z] };
+        }
+      });
+
+      // Widen the shirt's body sideways by widthMul. Body points (weight 0) widen fully,
+      // sleeve points (weight 1) not at all, so the sleeves stay attached at your shoulders.
+      const wk = widthMul - 1;
+      for (const d of deform) {
+        const P = d.pos.array, N = d.nor.array, R0 = d.rest, RN = d.restN;
+        const n = d.level.length;
+        for (let i = 0; i < n; i++) {
+          const lv = d.level[i], j = 3 * i;
+          const x = R0[j] * (1 + wk * (1 - lv / LEVELS)), y = R0[j + 1], z = R0[j + 2];
+          if (lv === 0) { P[j] = x; P[j + 1] = y; P[j + 2] = z; continue; }
+          const T = tables[d.side[i]][lv], e = T.e;
+          P[j]     = e[0] * x + e[3] * y + e[6] * z + T.t[0];
+          P[j + 1] = e[1] * x + e[4] * y + e[7] * z + T.t[1];
+          P[j + 2] = e[2] * x + e[5] * y + e[8] * z + T.t[2];
+          const nx = RN[j], ny = RN[j + 1], nz = RN[j + 2];
+          N[j]     = e[0] * nx + e[3] * ny + e[6] * nz;
+          N[j + 1] = e[1] * nx + e[4] * ny + e[7] * nz;
+          N[j + 2] = e[2] * nx + e[5] * ny + e[8] * nz;
+        }
+        d.pos.needsUpdate = true;
+        d.nor.needsUpdate = true;
+      }
+    }
+
+    // Every frame: draw your measured arm (yellow) and where the sleeve points now (cyan),
+    // and compute two numbers:
+    //   elbow check = how far the 3D arm's elbow lands from your REAL elbow on screen.
+    //                 Small (< ~25px) means the 3D→screen conversion is right.
+    //   bend        = the angle the sleeve would have to rotate to follow your arm.
+    let armCheck = { L: null, R: null };
+    const toPx = (p) => ({ x: p.x + layout.W / 2, y: layout.H / 2 - p.y });   // world → screen
+
+    function updateArmCheck(m) {
+      armCheck = { L: null, R: null };
+      if (!m.arms || !m.pxPerM) return;
+      for (const side of ['L', 'R']) {
+        const a = m.arms[side];
+        if (!a) continue;
+        const pivot = side === 'L' ? m.pL : m.pR;
+        const len = a.len * m.pxPerM;
+        const end = { x: pivot.x + a.dir.x * len, y: pivot.y + a.dir.y * len };
+        const err = Math.hypot(end.x - a.elbow2D.x, end.y - a.elbow2D.y);
+
+        let bend = null, restEnd = null, applied = null;
+        if (sleeveRest?.[side] && shirtGroup) {
+          // where the sleeve points NOW: modelled direction + our bend + the shirt's turn/tilt/depth
+          const rd = sleeveRest[side].dir.clone()
+            .applyQuaternion(sleeveQ[side])
+            .multiply(new THREE.Vector3(1, 1, depthNow))
+            .applyQuaternion(shirtGroup.quaternion).normalize();
+          bend = rd.angleTo(a.dir) * 180 / Math.PI;           // gap LEFT OVER after bending (want ≈ 0)
+          applied = qAngle(sleeveQ[side]) * 180 / Math.PI;    // how far we turned the sleeve
+          restEnd = { x: pivot.x + rd.x * len, y: pivot.y + rd.y * len };
+        }
+        armCheck[side] = { err, bend, applied };
+
+        if (!CONFIG.showArms) continue;
+        const p0 = toPx(pivot);
+        dctx.lineCap = 'round';
+        if (restEnd) {
+          const r1 = toPx(restEnd);
+          dctx.setLineDash([10, 8]); dctx.strokeStyle = '#0ff'; dctx.lineWidth = 5;
+          dctx.beginPath(); dctx.moveTo(p0.x, p0.y); dctx.lineTo(r1.x, r1.y); dctx.stroke();
+          dctx.setLineDash([]);
+        }
+        const p1 = toPx(end);
+        dctx.strokeStyle = '#ff0'; dctx.lineWidth = 6;
+        dctx.beginPath(); dctx.moveTo(p0.x, p0.y); dctx.lineTo(p1.x, p1.y); dctx.stroke();
+        dctx.fillStyle = '#ff0';
+        dctx.beginPath(); dctx.arc(p1.x, p1.y, 8, 0, Math.PI * 2); dctx.fill();
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // EACH NEW CAMERA FRAME
+    // ---------------------------------------------------------------------
+    function handleResult(result, now) {
+      try {
+        analyse(result, now);
+      } finally {
+        // Masks hold GPU memory — always release them, or the page slowly fills up.
+        result.segmentationMasks?.forEach((mk) => mk.close?.());
+      }
+    }
+
+    function analyse(result, now) {
+      dctx.clearRect(0, 0, layout.W, layout.H);
+      const lm = result.landmarks?.[0];
+      const wl = result.worldLandmarks?.[0];
+      latestLm = lm || null;
+
+      if (!lm) { failReason = 'no person in frame'; octx.clearRect(0, 0, layout.W, layout.H); return; }
+
+      const Ls = lm[11], Rs = lm[12];
+      if ((Ls.visibility ?? 0) < CONFIG.MIN_SHOULDER_VIS ||
+          (Rs.visibility ?? 0) < CONFIG.MIN_SHOULDER_VIS) {
+        failReason = 'shoulders not clearly visible';
+        octx.clearRect(0, 0, layout.W, layout.H);
+        if (CONFIG.showSkeleton) drawSkeleton(lm);
+        return;
+      }
+
+      const pL = screenToWorld(toScreen(Ls));
+      const pR = screenToWorld(toScreen(Rs));
+      let dx = pR.x - pL.x, dy = pR.y - pL.y;
+      if (dx < 0) { dx = -dx; dy = -dy; }
+      const mid = { x: (pL.x + pR.x) / 2, y: (pL.y + pR.y) / 2 };
+
+      let torsoLen = null, hipMid = null;
+      const Lh = lm[23], Rh = lm[24];
+      if ((Lh.visibility ?? 0) > 0.5 && (Rh.visibility ?? 0) > 0.5) {
+        const hL = screenToWorld(toScreen(Lh)), hR = screenToWorld(toScreen(Rh));
+        hipMid = { x: (hL.x + hR.x) / 2, y: (hL.y + hR.y) / 2 };
+        torsoLen = Math.hypot(hipMid.x - mid.x, hipMid.y - mid.y);
+      }
+
+      // Yaw, with the "facing away" fix: MediaPipe often can't tell front from back.
+      // If you look square-on but your nose isn't visible, you're showing your back.
+      let yaw = wl ? computeYaw(wl) : null;
+      backView = false;
+      if (yaw !== null && (lm[0].visibility ?? 1) < CONFIG.BACK_NOSE_VIS && Math.abs(Math.cos(yaw)) > 0.6) {
+        yaw += Math.PI;
+        backView = true;
+      }
+
+      // Your width-to-torso ratio measured in REAL 3D (metres). Unlike the on-screen
+      // ratio, it doesn't change when you lean toward the camera or turn — so we use it
+      // to reject bad on-screen samples (e.g. when you bend over to press F).
+      let ratio3D = null;
+      let arms = null, pxPerM = null;
+      if (wl) {
+        const d3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        const m3 = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 });
+        const torso3 = d3(m3(wl[11], wl[12]), m3(wl[23], wl[24]));
+        if (torso3 > 0.05) ratio3D = d3(wl[11], wl[12]) / torso3;
+
+        // STEP 5a — each upper arm as a 3D direction, converted into our scene's axes.
+        // MediaPipe 3D: x = image right, y = DOWN, z = AWAY from camera (smaller = closer).
+        // Our scene:    x = screen right (mirrored!), y = UP, z = TOWARD camera.
+        // pxPerM = how many screen pixels one real metre is, from your torso length.
+        if (torsoLen && torso3 > 0.05) pxPerM = torsoLen / torso3;
+        arms = {};
+        // 'L' = your left arm (landmarks 11→13) = the sleeve on the model's -x side
+        for (const [side, s, e] of [['L', 11, 13], ['R', 12, 14]]) {
+          if ((lm[s].visibility ?? 0) < 0.5 || (lm[e].visibility ?? 0) < 0.5) continue;
+          const dx = wl[e].x - wl[s].x, dy = wl[e].y - wl[s].y, dz = wl[e].z - wl[s].z;
+          arms[side] = {
+            dir: new THREE.Vector3(CONFIG.MIRROR ? -dx : dx, -dy, -dz).normalize(),
+            len: Math.hypot(dx, dy, dz),                       // upper-arm length in metres
+            elbow2D: screenToWorld(toScreen(lm[e])),          // where the elbow really is on screen
+          };
+        }
+      }
+
+      measured = {
+        pL, pR, mid, torsoLen, hipMid, ratio3D, arms, pxPerM,
+        hipsVis: Math.min(Lh.visibility ?? 0, Rh.visibility ?? 0),
+        shoulderWidth: Math.hypot(dx, dy),
+        tilt: Math.atan2(dy, dx),
+        yaw,
+      };
+
+      const mask = result.segmentationMasks?.[0];
+      if (mask) {
+        const data = mask.getAsFloat32Array();
+        paintMask(data, mask.width, mask.height);
+        silhouette = measureSilhouette(data, mask.width, mask.height, measured);
+        measureLight(data, mask.width, mask.height, lm);
+      }
+      applyLight();
+
+      if (CONFIG.showSkeleton) drawSkeleton(lm);
+      drawOcclusion(lm, wl, measured);
+      freshMeasurement = true;
+      lastGoodTime = now;
+    }
+
+    function updateShirt(now) {
+      const age = now - lastGoodTime;
+      if (age < 150)                 state = 'TRACKING';
+      else if (age < CONFIG.HOLD_MS) state = 'HOLDING — ' + failReason;
+      else                           state = 'LOST — ' + failReason;
+
+      const lost = age >= CONFIG.HOLD_MS;
+      markerL.visible = markerR.visible = !lost;
+      if (shirtGroup) shirtGroup.visible = !lost;
+      if (lost) { resetSmoothing(); octx.clearRect(0, 0, layout.W, layout.H); shirtMoved = true; return; }
+
+      if (!freshMeasurement) return;
+      freshMeasurement = false;
+      const m = measured;
+
+      markerL.position.set(m.pL.x, m.pL.y, 0);
+      markerR.position.set(m.pR.x, m.pR.y, 0);
+
+      if (!shirtGroup) return;
+      const yaw = m.yaw ?? 0;
+      const facing = Math.abs(Math.cos(yaw));                    // 1 = square-on, 0 = side-on
+      const sideness = clamp((Math.abs(Math.sin(yaw)) - 0.5) / 0.4, 0, 1);  // 1 = fully side-on
+
+      // --- Size (from Step 2) ---
+      // Learn the on-screen ratio ONLY from good samples: facing the camera, hips clearly
+      // visible, a believable value, and agreeing with the 3D ratio (if you lean toward
+      // the camera, your torso looks short on screen and the two disagree → ignored).
+      // Raising an arm lifts and pulls in that shoulder point, so your shoulders LOOK
+      // narrower even though you didn't change. armUp: 0 = arms at/below horizontal,
+      // 1 = an arm raised well above it. (Arm direction y: + = up.)
+      // Your screenshots showed reaching FORWARD narrows the shoulders too (they roll in),
+      // so shoulders are only fully trusted while both arms HANG (more than ~45° below horizontal).
+      const armY = Math.max(m.arms?.L?.dir.y ?? -1, m.arms?.R?.dir.y ?? -1);
+      const armUp = clamp((armY + 0.7) / 0.6, 0, 1);     // 0 = both hanging, 1 = an arm level or higher
+      lastArmUp = armUp;
+      // Learn your body shape ONLY in the plain standing pose: both arms seen and hanging down.
+      const armsLow = !!(m.arms?.L && m.arms?.R) && armY < -0.75;
+
+      if (facing > 0.95 && m.torsoLen && m.hipsVis > 0.85 && armsLow) {
+        const r = m.shoulderWidth / m.torsoLen;
+        const agrees = m.ratio3D === null || Math.abs(r - m.ratio3D) / m.ratio3D < 0.15;
+        if (agrees && r > 0.4 && r < 0.95) {
+          bodyRatio = bodyRatio === null ? r : bodyRatio + 0.05 * (r - bodyRatio);
+        }
+      }
+      const fromShoulders = m.shoulderWidth / Math.max(facing, 0.3);
+      const fromTorso = (bodyRatio !== null && m.torsoLen) ? m.torsoLen * bodyRatio : null;
+      // Trust the shoulders when facing the camera AND no arm is raised; otherwise lean on torso length.
+      const trust = clamp((facing - 0.5) / 0.4, 0, 1) * (fromTorso === null ? 1 : 1 - armUp);
+      let trueWidth;
+      if (fromTorso === null) { trueWidth = fromShoulders; sizeSource = 'shoulders only'; }
+      else {
+        trueWidth = trust * fromShoulders + (1 - trust) * fromTorso;
+        sizeSource = trust > 0.99 ? 'shoulders' : trust < 0.01 ? 'torso' : 'blend';
+      }
+      const scale = trueWidth * CONFIG.fitWidth;
+
+      // --- NEW: depth, learned from your real outline when you stand side-on ---
+      // Side-on, the mask width at chest/waist IS your body's depth. We stretch the
+      // shirt front-to-back (only) until it covers that, plus a little ease.
+      let silCenter = null;
+      if (silhouette && modelSize) {
+        const rows = [silhouette.chest, silhouette.waist].filter(Boolean);
+        if (rows.length) {
+          silCenter = rows.reduce((s, r) => s + r.center, 0) / rows.length;
+          // Only with arms hanging: an arm held forward or back side-on widens the outline.
+          if (sideness > 0.9 && armY < -0.75) {
+            const bodyDepth = Math.max(...rows.map((r) => r.width));
+            const modelDepth = scale * (modelSize.z / modelSize.x);
+            const target = clamp(bodyDepth * CONFIG.LOOSE / modelDepth, 0.7, 3);
+            depthMul += 0.1 * (target - depthMul);
+            depthLearned = true;
+          }
+        }
+      }
+
+      // --- Front-on width: make the shirt's body at least as wide as YOURS (+ ease), so the
+      // clothes you're wearing don't peek out at the sides. Learned only while you face the
+      // camera with BOTH arms held away from your sides: then the outline at chest and waist
+      // height is your torso alone (hanging arms would be counted as body).
+      const armsOut = !!(m.arms?.L && m.arms?.R) && Math.min(m.arms.L.dir.y, m.arms.R.dir.y) > -0.6;
+      if (silhouette && modelBodyW && facing > 0.95 && armsOut) {
+        const rows = [silhouette.chest, silhouette.waist].filter(Boolean);
+        if (rows.length) {
+          const bodyW = Math.max(...rows.map((r) => r.width));
+          // Never let the body grow under your hanging arms: its edge must stop where your
+          // arm starts (shoulder joint minus about half an arm's thickness). Otherwise the
+          // hanging sleeves get swallowed by the body and the shirt turns into a box.
+          const px = Math.abs(sleeveRest.R.pivot.x);
+          const maxMul = Math.max(1, 2 * (1 - CONFIG.ARM_GAP) * px / modelBodyW);
+          const target = clamp(bodyW * CONFIG.LOOSE / (scale * modelBodyW), 1, maxMul);  // only ever widen
+          widthMul += 0.1 * (target - widthMul);
+          widthLearned = true;
+        }
+      }
+
+      // Position: normally hang from your shoulders. Side-on, the shoulder joints sit
+      // toward your back, so slide the shirt to the centre of your real outline.
+      let x = m.mid.x + CONFIG.offsetX * trueWidth;
+      if (silCenter !== null) x = x + sideness * (silCenter - x);
+
+      shirtGroup.position.set(ema('x', x), ema('y', m.mid.y + CONFIG.offsetY * trueWidth), 0);
+      const s = ema('s', scale);
+      // Depth only matters when you're turned. Facing the camera, a deep shirt pushes its
+      // front panel forward and hides the hanging sleeves behind it — so fade it in with the turn.
+      depthNow = 1 + (depthMul - 1) * sideness;
+      shirtGroup.scale.set(s, s, s * depthNow);       // z = front-to-back depth only
+      shirtGroup.rotation.z = ema('tilt', m.tilt * trust);
+      shirtGroup.rotation.y = CONFIG.applyYaw ? emaAngle('yaw', CONFIG.YAW_SIGN * yaw) : 0;
+      shirtMoved = true;
+      updateSleeves(m);
+      updateArmCheck(m);
+    }
+
+    // ---------------------------------------------------------------------
+    // HUD
+    // ---------------------------------------------------------------------
+    let frames = 0, detections = 0, fps = 0, dps = 0, lastFpsTime = 0, lastHudTime = 0;
+    const deg = (r) => (r * 180 / Math.PI).toFixed(1).padStart(6) + '°';
+    const vis = (p) => (p ? (p.visibility ?? 0).toFixed(2) : ' -- ');
+    const px = (row) => (row ? row.width.toFixed(0) + 'px' : '--');
+    const restAngle = (d) => (Math.atan2(-d.y, Math.abs(d.x)) * 180 / Math.PI).toFixed(0) + '°';
+
+    function updateHud(now) {
+      if (now - lastFpsTime >= 1000) {
+        fps = frames; dps = detections; frames = detections = 0; lastFpsTime = now;
+      }
+      if (now - lastHudTime < 100) return;
+      lastHudTime = now;
+      hud.style.display = CONFIG.showHud ? 'block' : 'none';
+      if (!CONFIG.showHud) return;
+
+      if (loadError) { hud.textContent = 'ERROR: ' + loadError; hud.style.color = '#f66'; return; }
+
+      const lm = latestLm, m = measured;
+      hud.textContent =
+`STATE: ${state}
+camera ${['empty', 'metadata only', 'one frame', 'buffering', 'playing'][video.readyState]}${video.paused ? ' (PAUSED)' : ''} | pose model ${landmarker ? 'ready' : 'loading…'} | render ${fps} fps | pose ${dps}/s
+visibility  shoulders L ${vis(lm?.[11])} R ${vis(lm?.[12])} | hips L ${vis(lm?.[23])} R ${vis(lm?.[24])} | nose ${vis(lm?.[0])}
+shoulders ${m ? m.shoulderWidth.toFixed(0) : '--'}px  tilt ${m ? deg(m.tilt) : '--'}  yaw ${m && m.yaw !== null ? deg(m.yaw) : '--'}  view ${backView ? 'BACK' : 'front'}
+size from ${sizeSource} | arm raised ${lastArmUp.toFixed(2)} | width/torso ${bodyRatio === null ? 'learning — face camera' : bodyRatio.toFixed(2)} (3D now ${m && m.ratio3D !== null ? m.ratio3D.toFixed(2) : '--'})
+mask ${maskReady ? maskCanvas.width + 'x' + maskCanvas.height : 'waiting'} | outline chest ${px(silhouette?.chest)} waist ${px(silhouette?.waist)}
+body width ×${widthMul.toFixed(2)} ${widthLearned ? '' : '(hold arms out once to learn)'} | depth ×${depthMul.toFixed(2)} (now ×${depthNow.toFixed(2)}) ${depthLearned ? '' : '(stand side-on to learn)'} | arms in front ${CONFIG.occlusion ? 'ON' : 'OFF'} | turn ${CONFIG.applyYaw ? 'ON' : 'OFF'}
+fit ×${CONFIG.fitWidth.toFixed(2)}  offX ${CONFIG.offsetX.toFixed(2)}  offY ${CONFIG.offsetY.toFixed(2)}
+light ${CONFIG.lightMatch ? 'MATCH' : 'OFF'}: room ${light.lum.toFixed(2)} → shirt ×${light.k.toFixed(2)} | tint r${light.r.toFixed(2)} g${light.g.toFixed(2)} b${light.b.toFixed(2)} | from ${light.side >= 0 ? 'right' : 'left'} ${Math.abs(light.side).toFixed(2)} | shadow ${CONFIG.shadow ? 'ON' : 'OFF'}
+sleeves: rest ${sleeveRest?.L ? restAngle(sleeveRest.L.dir) : '--'} / ${sleeveRest?.R ? restAngle(sleeveRest.R.dir) : '--'} below horizontal | bending ${CONFIG.bendSleeves ? 'ON' : 'OFF'} (${movingCount} moving pts) | weights view ${CONFIG.showWeights ? 'ON' : 'OFF'}
+arms: elbow check L ${armCheck.L ? armCheck.L.err.toFixed(0) + 'px' : '--'} R ${armCheck.R ? armCheck.R.err.toFixed(0) + 'px' : '--'} | turned L ${armCheck.L?.applied != null ? armCheck.L.applied.toFixed(0) + '°' : '--'} R ${armCheck.R?.applied != null ? armCheck.R.applied.toFixed(0) + '°' : '--'} | left over L ${armCheck.L?.bend != null ? armCheck.L.bend.toFixed(0) + '°' : '--'} R ${armCheck.R?.bend != null ? armCheck.R.bend.toFixed(0) + '°' : '--'} (want ≈ 0)
+keys: C capture → CatVTON · arrows/+/- fit · F freeze · B bend · W weights · A arm lines · O arms-in-front · L light · D shadow · [ ] brighter · S skeleton · H hide · Y/N turn · P print`;
+    }
+
+    // ---------------------------------------------------------------------
+    // FREEZE (F key)
+    // ---------------------------------------------------------------------
+    let freezeAt = null;
+    let frozen = false;
+    const countdownEl = document.getElementById('countdown');
+
+    // ---------------------------------------------------------------------
+    // STEP 6a — CAPTURE → CatVTON
+    // Press C: after a short countdown we take two pictures and send them to the
+    // Python bridge (tryon_server.py), which runs CatVTON and sends back the result.
+    //   1) "person": a clean camera frame (no shirt overlay, not mirrored — a real
+    //      photo), cropped to a 3:4 portrait around you, 768×1024.
+    //   2) "garment": the SAME 3D shirt rendered flat-front on white, like a product
+    //      photo — so the AI result shows the shirt you were trying on live.
+    // ---------------------------------------------------------------------
+    let captureAt = null, capturing = false, panelOpen = false;
+    const panel = document.getElementById('result-panel');
+    const resStatus = document.getElementById('res-status');
+
+    // The 3:4 portrait window (in camera pixels) used for BOTH the photo and the mask.
+    function captureCrop() {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      let cw = Math.round(vh * 3 / 4), ch = vh;
+      if (cw > vw) { cw = vw; ch = Math.round(vw * 4 / 3); }
+      // centre the crop on your shoulders (landmarks are in the un-mirrored video frame)
+      const cx = latestLm ? ((latestLm[11].x + latestLm[12].x) / 2) * vw : vw / 2;
+      return { x0: clamp(Math.round(cx - cw / 2), 0, vw - cw), y0: Math.round((vh - ch) / 2), cw, ch };
+    }
+
+    function capturePerson(crop) {
+      const c = document.createElement('canvas');
+      c.width = 768; c.height = 1024;
+      c.getContext('2d').drawImage(video, crop.x0, crop.y0, crop.cw, crop.ch, 0, 0, 768, 1024);
+      return c;
+    }
+
+    // Step 6b: OUR OWN mask — the only area CatVTON may repaint. White = may change,
+    // transparent = keep exactly (face, arms below the sleeves, pants, background).
+    // Built from your pose: torso from just above the shoulders down to the hips, plus
+    // the top 65% of each upper arm (where a T-shirt sleeve sits) — then trimmed to your
+    // real outline (person mask), grown a little so a slightly bigger shirt has room.
+    function captureMask(crop) {
+      if (!maskReady || !latestLm) return null;
+      const lm = latestLm, vw = video.videoWidth, vh = video.videoHeight;
+      if (Math.min(lm[23].visibility ?? 0, lm[24].visibility ?? 0) < 0.5) return null;  // need hips
+      const P = (i) => ({ x: lm[i].x * vw, y: lm[i].y * vh });       // camera pixels, un-mirrored
+      const ls = P(11), rs = P(12), lh = P(23), rh = P(24), le = P(13), re = P(14);
+      const sw = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+      const away = (a, b, k) => ({ x: a.x + (a.x - b.x) * k, y: a.y + (a.y - b.y) * k });
+
+      const c = document.createElement('canvas');
+      c.width = vw; c.height = vh;
+      const g = c.getContext('2d');
+      g.fillStyle = g.strokeStyle = '#fff';
+      g.lineCap = 'round';
+      const up = 0.15 * sw;                                      // cover the shoulder tops, not the chin
+      const lsO = away(ls, rs, 0.12), rsO = away(rs, ls, 0.12);
+      const lhO = away(lh, rh, 0.45), rhO = away(rh, lh, 0.45);  // hip joints sit inside the body edge
+      // The collar curves UP around the base of the neck, above the shoulder line. Raise the
+      // top edge in a curve whose peak sits 40% of the way from the shoulder line to the mouth
+      // (≈ where a crew neck sits) — high enough to cover your own collar, low enough to
+      // leave your chin and most of your neck alone.
+      const mouth = { x: (P(9).x + P(10).x) / 2, y: (P(9).y + P(10).y) / 2 };
+      const midY = (ls.y + rs.y) / 2;
+      const neckTop = midY - Math.max(up, CONFIG.NECK_RISE * (midY - mouth.y));
+      const a = { x: lsO.x, y: lsO.y - up }, b = { x: rsO.x, y: rsO.y - up };
+      // A broad, flat-topped dome (cubic curve), so the whole collar ring is covered — not
+      // just its middle. Both control points share one height, chosen so the curve's
+      // middle lands exactly on neckTop: mid = (a + 3c + 3c + b) / 8.
+      const cy = (8 * neckTop - a.y - b.y) / 6, w = b.x - a.x;
+      g.beginPath();
+      g.moveTo(a.x, a.y);
+      g.bezierCurveTo(a.x + 0.05 * w, cy, b.x - 0.05 * w, cy, b.x, b.y);
+      g.lineTo(rhO.x, rhO.y); g.lineTo(lhO.x, lhO.y);
+      g.closePath(); g.fill();
+      g.lineWidth = 0.4 * sw;
+      for (const [s, e] of [[ls, le], [rs, re]]) {
+        g.beginPath(); g.moveTo(s.x, s.y);
+        g.lineTo(s.x + 0.65 * (e.x - s.x), s.y + 0.65 * (e.y - s.y)); g.stroke();
+      }
+      // Keep a copy of the pure pose shape, before trimming — the safety net below needs it.
+      const shape = document.createElement('canvas');
+      shape.width = vw; shape.height = vh;
+      shape.getContext('2d').drawImage(c, 0, 0);
+
+      // keep only where you actually are (blurred person mask → a few pixels of room)
+      g.globalCompositeOperation = 'destination-in';
+      g.filter = `blur(${Math.max(2, Math.round(0.03 * sw))}px)`;
+      g.drawImage(maskCanvas, 0, 0, vw, vh);
+
+      // same crop as the photo, then hard edges: white (keep) or fully transparent
+      const cropHard = (src) => {
+        const o = document.createElement('canvas');
+        o.width = 768; o.height = 1024;
+        const og = o.getContext('2d');
+        og.drawImage(src, crop.x0, crop.y0, crop.cw, crop.ch, 0, 0, 768, 1024);
+        const img = og.getImageData(0, 0, 768, 1024), d = img.data;
+        let on = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const v = d[i + 3] > 40 ? 255 : 0;
+          d[i] = d[i + 1] = d[i + 2] = d[i + 3] = v;
+          if (v) on++;
+        }
+        og.putImageData(img, 0, 0);
+        return { o, on };
+      };
+      const trimmed = cropHard(c), pose = cropHard(shape);
+      maskStats = `outline kept ${pose.on ? Math.round(100 * trimmed.on / pose.on) : 0}% of the shirt shape`;
+      // Safety net: if trimming to your outline threw away more than half of the shirt
+      // shape, the outline was bad for this frame — use the pose shape on its own.
+      if (trimmed.on < 0.5 * pose.on) {
+        maskFallback = true;
+        return pose.on > 1000 ? pose.o : null;
+      }
+      maskFallback = false;
+      return trimmed.on > 1000 ? trimmed.o : null;               // nearly empty = something went wrong
+    }
+    let maskFallback = false, maskStats = '';
+
+    // Photo + red tint where CatVTON may repaint — so you can check the mask by eye.
+    function maskPreview(personCanvas, maskCanvasOut) {
+      const p = document.createElement('canvas');
+      p.width = 768; p.height = 1024;
+      const g = p.getContext('2d');
+      g.drawImage(personCanvas, 0, 0);
+      if (maskCanvasOut) {
+        const t = document.createElement('canvas');
+        t.width = 768; t.height = 1024;
+        const tg = t.getContext('2d');
+        tg.drawImage(maskCanvasOut, 0, 0);
+        tg.globalCompositeOperation = 'source-in';
+        tg.fillStyle = 'rgba(255,0,0,0.45)';
+        tg.fillRect(0, 0, 768, 1024);
+        g.drawImage(t, 0, 0);
+      }
+      return p;
+    }
+
+    // Step 6b: a REAL product photo beats the 3D render. If the folder next to index.html
+    // has garment.jpg or garment.png, that photo is sent to CatVTON instead of the render.
+    async function loadGarmentPhoto() {
+      for (const name of ['garment.jpg', 'garment.png']) {
+        try {
+          const r = await fetch(name, { cache: 'no-store' });
+          if (r.ok && (r.headers.get('content-type') || '').startsWith('image/')) return { blob: await r.blob(), name };
+        } catch (e) { /* not there — fine */ }
+      }
+      return null;
+    }
+
+    // The shirt exactly as modelled (no bending, no widening), front-on, on white.
+    // Uses its own small renderer so the live view is never disturbed.
+    let garment = null;
+    function renderGarment() {
+      if (!deform.length) return null;
+      const W = 768, H = 1024;
+      if (!garment) {
+        const r = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+        r.setPixelRatio(1);
+        r.setSize(W, H, false);
+        r.setClearColor(0xffffff, 1);
+        const sc = new THREE.Scene();
+        sc.add(new THREE.HemisphereLight(0xffffff, 0x888888, 1.3));
+        const dl = new THREE.DirectionalLight(0xffffff, 1.2);
+        dl.position.set(0.3, 0.6, 1);
+        sc.add(dl);
+        const box = new THREE.Box3();
+        for (const d of deform) {
+          const src = d.mesh.geometry, g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(d.rest.slice(), 3));
+          g.setAttribute('normal', new THREE.BufferAttribute(d.restN.slice(), 3));
+          for (const name in src.attributes) {
+            if (name !== 'position' && name !== 'normal') g.setAttribute(name, src.attributes[name]);
+          }
+          if (src.index) g.setIndex(src.index);
+          for (const gr of src.groups) g.addGroup(gr.start, gr.count, gr.materialIndex);
+          g.computeBoundingBox();
+          box.union(g.boundingBox);
+          sc.add(new THREE.Mesh(g, d.mesh.material));
+        }
+        // frame the shirt with a margin, keeping the 3:4 shape
+        const size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+        let hw = size.x / 2 * 1.12, hh = size.y / 2 * 1.12;
+        if (hw / hh > W / H) hh = hw * H / W; else hw = hh * W / H;
+        const cam = new THREE.OrthographicCamera(-hw, hw, hh, -hh, 0.1, 20);
+        cam.position.set(c.x, c.y, 5);
+        garment = { r, sc, cam };
+      }
+      garment.r.render(garment.sc, garment.cam);
+      return garment.r.domElement;
+    }
+
+    const toBlob = (canvas, type, q) => new Promise((ok) => canvas.toBlob(ok, type, q));
+    function download(blob, name) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    }
+    function openPanel() { panel.style.display = 'block'; panelOpen = true; }
+    function closePanel() { panel.style.display = 'none'; panelOpen = false; }
+
+    async function doCapture() {
+      capturing = true;
+      try {
+        const crop = captureCrop();
+        const personCanvas = capturePerson(crop);
+        const maskOut = captureMask(crop);
+        const personBlob = await toBlob(personCanvas, 'image/jpeg', 0.92);
+        const maskBlob = maskOut ? await toBlob(maskOut, 'image/png') : null;
+
+        const photo = await loadGarmentPhoto();
+        let garmentBlob, garmentLabel;
+        if (photo) {
+          // Paste onto white HERE, so the preview shows exactly what CatVTON receives
+          // (a see-through part of a PNG would otherwise look dark in the panel but
+          // arrive at CatVTON as white).
+          const bmp = await createImageBitmap(photo.blob);
+          const fc = document.createElement('canvas');
+          fc.width = bmp.width; fc.height = bmp.height;
+          const fg = fc.getContext('2d');
+          fg.fillStyle = '#fff'; fg.fillRect(0, 0, fc.width, fc.height);
+          fg.drawImage(bmp, 0, 0);
+          garmentBlob = await toBlob(fc, 'image/jpeg', 0.95);
+          garmentLabel = `Shirt sent: ${photo.name} (real photo)`;
+        } else {
+          const garmentCanvas = renderGarment();
+          if (!garmentCanvas) { alert('The shirt has not finished loading yet.'); return; }
+          garmentBlob = await toBlob(garmentCanvas, 'image/png');
+          garmentLabel = 'Shirt sent: 3D render (add garment.jpg for a real photo)';
+        }
+
+        document.getElementById('res-person').src = maskPreview(personCanvas, maskOut).toDataURL('image/jpeg', 0.85);
+        document.getElementById('cap-person').textContent = !maskOut
+          ? 'You (no mask: CatVTON guesses — need shoulders + hips in view)'
+          : maskFallback
+            ? `You — red = area CatVTON may change (outline failed, used pose shape: ${maskStats})`
+            : `You — red = the only area CatVTON may change (${maskStats})`;
+        console.log('capture mask:', maskOut ? (maskFallback ? 'pose shape (fallback)' : 'trimmed') : 'none',
+                    '|', maskStats, '| camera', video.videoWidth + 'x' + video.videoHeight,
+                    '| person mask', maskCanvas.width + 'x' + maskCanvas.height);
+        document.getElementById('res-garment').src = URL.createObjectURL(garmentBlob);
+        document.getElementById('cap-garment').textContent = garmentLabel;
+        document.getElementById('res-result').removeAttribute('src');
+        resStatus.textContent = 'Sending to CatVTON… (this usually takes 20–90 seconds)';
+        openPanel();
+
+        const form = new FormData();
+        form.append('person', personBlob, 'person.jpg');
+        form.append('garment', garmentBlob, photo ? photo.name : 'garment.png');
+        if (maskBlob) form.append('mask', maskBlob, 'mask.png');
+        const t0 = performance.now();
+        let res;
+        try {
+          res = await fetch(CONFIG.BRIDGE_URL, { method: 'POST', body: form });
+        } catch (e) {
+          // Bridge not running: still give you the two pictures, so you can test them by hand.
+          download(personBlob, 'person.jpg');
+          download(garmentBlob, 'garment.png');
+          resStatus.textContent = 'Bridge not reachable (is tryon_server.py running?). ' +
+            'Saved person.jpg and garment.png to your Downloads instead.';
+          return;
+        }
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          resStatus.textContent = `Bridge answered ${res.status}: ${j.error || 'unknown error'}`;
+          return;
+        }
+        document.getElementById('res-result').src = URL.createObjectURL(await res.blob());
+        resStatus.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+      } finally {
+        capturing = false;
+      }
+    }
+
+    function startCapture() {
+      if (panelOpen) { closePanel(); return; }
+      if (capturing || captureAt !== null) return;
+      captureAt = performance.now() + CONFIG.CAPTURE_DELAY;
+    }
+    document.getElementById('capture-btn').addEventListener('click', (e) => { e.currentTarget.blur(); startCapture(); });
+
+    function updateCountdown(now) {
+      if (captureAt !== null) {
+        countdownEl.style.display = 'block';
+        countdownEl.textContent = 'Capture in ' + Math.ceil((captureAt - now) / 1000);
+      } else if (freezeAt !== null) {
+        countdownEl.style.display = 'block';
+        countdownEl.textContent = Math.ceil((freezeAt - now) / 1000);
+      } else if (frozen) {
+        countdownEl.style.display = 'block';
+        countdownEl.textContent = 'FROZEN — press F';
+      } else {
+        countdownEl.style.display = 'none';
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'c') { startCapture(); return; }
+      if (e.key === 'Escape') { closePanel(); return; }
+      if (k === 'f') {
+        if (frozen) frozen = false;
+        else if (freezeAt === null) freezeAt = performance.now() + 5000;
+        else freezeAt = null;
+        return;
+      }
+      const step = 0.01;
+      if (e.key === 'ArrowUp') CONFIG.offsetY += step;
+      if (e.key === 'ArrowDown') CONFIG.offsetY -= step;
+      if (e.key === 'ArrowLeft') CONFIG.offsetX -= step;
+      if (e.key === 'ArrowRight') CONFIG.offsetX += step;
+      if (e.key === '+' || e.key === '=') CONFIG.fitWidth += 0.02;
+      if (e.key === '-' || e.key === '_') CONFIG.fitWidth -= 0.02;
+      if (k === 's') { CONFIG.showSkeleton = !CONFIG.showSkeleton; dctx.clearRect(0, 0, layout.W, layout.H); }
+      if (k === 'h') CONFIG.showHud = !CONFIG.showHud;
+      if (k === 'o') CONFIG.occlusion = !CONFIG.occlusion;
+      if (k === 'a') CONFIG.showArms = !CONFIG.showArms;
+      if (k === 'b') CONFIG.bendSleeves = !CONFIG.bendSleeves;
+      if (k === 'w') { CONFIG.showWeights = !CONFIG.showWeights; applyWeightView(); }
+      if (k === 'l') { CONFIG.lightMatch = !CONFIG.lightMatch; applyLight(); }
+      if (k === 'd') { CONFIG.shadow = !CONFIG.shadow; shirtMoved = true; }
+      if (e.key === '[') CONFIG.brightness = Math.max(0.3, CONFIG.brightness - 0.05);
+      if (e.key === ']') CONFIG.brightness = Math.min(2.0, CONFIG.brightness + 0.05);
+      if (k === 'y') CONFIG.YAW_SIGN *= -1;
+      if (k === 'n') CONFIG.applyYaw = !CONFIG.applyYaw;
+      if (k === 'p') {
+        console.log(`fitWidth: ${CONFIG.fitWidth.toFixed(2)}, offsetX: ${CONFIG.offsetX.toFixed(2)}, offsetY: ${CONFIG.offsetY.toFixed(2)}, brightness: ${CONFIG.brightness.toFixed(2)},`);
+      }
+    });
+
+    // ---------------------------------------------------------------------
+    // ONE main loop
+    // ---------------------------------------------------------------------
+    let lastVideoTime = -1;
+    function loop() {
+      requestAnimationFrame(loop);
+      const now = performance.now();
+      frames++;
+
+      if (freezeAt !== null && now >= freezeAt) { frozen = true; freezeAt = null; }
+      if (captureAt !== null && now >= captureAt) { captureAt = null; doCapture(); }
+
+      if (!frozen) {
+        if (video.readyState >= 2) {
+          drawMapped(vctx, video);
+          if (landmarker && video.currentTime !== lastVideoTime) {
+            lastVideoTime = video.currentTime;
+            handleResult(landmarker.detectForVideo(video, now), now);
+            detections++;
+          }
+        }
+        updateShirt(now);
+      }
+      renderer.render(scene, camera);
+      // The shadow is copied from the shirt render, so it must be drawn right after it.
+      if (shirtMoved) { drawShadow(); shirtMoved = false; }
+      updateHud(now);
+      updateCountdown(now);
+    }
+
+    // ---------------------------------------------------------------------
+    // START
+    // ---------------------------------------------------------------------
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
+    }).then((stream) => {
+      video.srcObject = stream;
+      video.addEventListener('loadedmetadata', () => {
+        updateLayout();
+        video.play().catch((e) => { loadError = 'Camera video would not start: ' + e.message; });
+      });
+    }).catch((err) => {
+      loadError = 'Camera blocked or unavailable: ' + err.message;
+    });
+
+    updateLayout();
+    setupLandmarker().catch((e) => { loadError = 'Pose model failed to load: ' + e.message; });
+    loop();
+  </script>
+</body>
+</html>

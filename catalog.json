@@ -1,0 +1,7 @@
+{
+  "items": [
+    { "name": "Olive polo", "model": "polo.glb", "neckRise": 0.65, "guidance": 7 },
+    { "name": "Geometric print", "model": "shirt.glb", "fabric": "knit" },
+    { "name": "Red tee", "model": "shirt.glb", "color": "#c41e24", "photo": "garment.png" }
+  ]
+}
