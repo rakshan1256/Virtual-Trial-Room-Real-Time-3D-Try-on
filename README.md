@@ -3,10 +3,10 @@
 A webcam "mirror" that puts a 3D shirt on you **live**: it follows your shoulders, turns with your body, bends its sleeves with your arms and fits itself to your body shape — all in the browser, no install.
 A second mode takes a photo and sends it to a diffusion try-on model (CatVTON) for a photo-realistic result.
 
-![Live 3D mirror with the developer readout on](docs/live-mirror.png)
+![Live 3D mirror with the developer readout on](/screenshots/catvton_capture.jpg)
 *Live mirror (developer view): the 3D polo tracks shoulders, arms and turn in real time. The readout on the left shows the live tracking and fit numbers.*
 
-![Photo try-on with CatVTON](docs/catvton-capture.png)
+![Photo try-on with CatVTON](/screenshots/live_mirror.jpg)
 *Photo mode: your camera frame (left; red = the only area the AI may repaint), the garment (middle), and the CatVTON result (right).*
 
 ---
